@@ -1,0 +1,166 @@
+Salt Stack安装与获取facter的api测试
+
+1. Salt Stack的安装（RHEL7）
+
+添加CentOS7的yum源
+添加epel7的yum源
+
+#yum install salt-minion -y           安装客户端
+#yum install salt-master -y           安装服务器
+
+由于测试环境中，目的是测试api，所以，客户端和服务器都装在了同一台服务器上，如果是生产环境， 可以在被管理机上只安装salt-minion即可
+
+在客户机上修改minion配置文件 
+#vi /etc/salt/minion
+master: 192.168.56.20  只修改这一行即可
+
+设置服务开机启动并启动服务
+[root@zabbix-server salt]# systemctl enable salt-master
+[root@zabbix-server salt]# systemctl enable salt-minion
+[root@zabbix-server salt]# systemctl start salt-master
+[root@zabbix-server salt]# systemctl start salt-minion
+
+客户端第一次启动连接的时候，会给服务器发key的认证请求，在服务器上查询并接受
+[root@zabbix-server salt]# salt-key -L
+Accepted Keys:
+Denied Keys:
+Unaccepted Keys:
+zabbix-server
+Rejected Keys:
+[root@zabbix-server salt]# salt-key -A
+The following keys are going to be accepted:
+Unaccepted Keys:
+zabbix-server
+Proceed? [n/Y] Y
+Key for minion zabbix-server accepted.
+
+查看客户端状态
+[root@zabbix-server salt]# salt '*' test.ping
+zabbix-server:
+    True
+
+这个证明salt已经安装成功了
+接下来尝试使用salt执行一个远程命令uptime
+[root@zabbix-server salt]# salt zabbix-server cmd.run 'uptime'
+zabbix-server:
+     11:18:12 up 54 min,  3 users,  load average: 0.01, 0.10, 0.08
+
+2.利用grain模块查询服务器的配置信息
+
+grain模块是记录的客户端“静态数据”，这个数据在minion启动的时候收集，所以，如果重新修改了一些配置，grain是不知道的，需要重启minion或者在主控端刷新grains数据
+# salt '*' saltutil.sync_grains
+
+常用命令：查询都有哪些grain项
+[root@zabbix-server salt]# salt zabbix-server grains.ls
+zabbix-server:
+    - SSDs
+    - biosreleasedate
+    - biosversion
+    - cpu_flags
+    - cpu_model
+    - cpuarch
+…
+查询某个grain项的值
+[root@zabbix-server salt]# salt zabbix-server grains.item os
+zabbix-server:
+    ----------
+    os:
+        RedHat
+
+也可以获得所有grain的值
+[root@zabbix-server salt]# salt zabbix-server grains.items
+
+
+
+3.利用python的api访问grain数据
+
+salt的api写起来比较方便，主要是用到下面的函数
+
+salt.loader.grains(opts, force_refresh=False, proxy=None)
+
+
+[root@zabbix-server ~]# python
+Python 2.7.5 (default, Aug  2 2016, 04:20:16)
+[GCC 4.8.5 20150623 (Red Hat 4.8.5-4)] on linux2
+Type "help", "copyright", "credits" or "license" for more information.
+>>> import salt.config
+>>> import salt.loader
+>>>
+>>> __opts__ = salt.config.minion_config('/etc/salt/minion')
+>>> __grains__ = salt.loader.grains(__opts__)
+>>> print __grains__['id']
+zabbix-server
+>>> print __grains__['os']
+RedHat
+>>> print __grains__    这个命令会打印出所有的grains值，可以解析成json
+
+下个文档介绍怎么创建新的grains
+我们使用服务器端扩展grains的方法
+在服务器端，创建目录
+[root@zabbix-server srv]# install -d /srv/salt/_grains    这个命令实际上就是创建了一个目录，只不过用这个命令能够直接设置好目录的权限
+
+我们编写个grains，来获取客户端的内存使用
+#vi grains_memusage.py  这个要符合python的文件定义，所以，里面的def要符合驼峰写法,另外，前面必须有utf-8的声明，要不然不认识中文，会出错
+
+#!/usr/bin/env python
+# -*- coding:utf-8 -*-
+
+import os,sys,commands
+
+def Grains_Memusage():
+    '''
+        return os Memory Usage
+    '''
+    grains = {}  #初始化字典，必须是graiins
+
+    _mem_usage=0  #设置默认值
+
+    try:
+        getmemusage = commands.getstatusoutput("source /etc/profile;free |grep Mem |awk '{printf $3}'")  #执行命令获取内存使用量
+    except Exception,e:
+        pass
+
+    if getmemusage[0]==0:
+        _mem_usage=int(getmemusage[1])
+    grains['mem_usage'] = _mem_usage   #进行赋值，前面是key，后面是value
+    return grains
+
+同步grains的定义到所有客户端
+[root@zabbix-server _grains]# salt '*' saltutil.sync_all
+zabbix-server:
+    ----------
+    beacons:
+    grains:
+        - grains.grains_memusage
+    modules:
+    output:
+
+查看新定义的参数值
+[root@zabbix-server _grains]# salt '*' grains.item mem_usage
+zabbix-server:
+    ----------
+    mem_usage:
+        570396
+重复执行多次，可以看到值不会变化
+
+执行刷新命令
+[root@zabbix-server _grains]# salt '*' saltutil.sync_grains
+zabbix-server:
+[root@zabbix-server _grains]# vi grains_memusage.py
+[root@zabbix-server _grains]# salt '*' grains.item mem_usage
+zabbix-server:
+    ----------
+    mem_usage:
+        550444
+刷新后值发生了变化
+
+在API中，直接在load的时候，加入刷新的参数：(我好像在测试的时候，加不加那个force_refresh参数都会取到新数据，不过，加上保险）
+
+>>> __grains__ = salt.loader.grains(__opts__,force_refresh=True)
+>>> print __grains__['mem_usage']
+562824
+>>> print __grains__['mem_usage']
+562824
+>>> __grains__ = salt.loader.grains(__opts__,force_refresh=True)
+>>> print __grains__['mem_usage']
+562616
